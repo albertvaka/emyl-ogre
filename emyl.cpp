@@ -4,27 +4,46 @@
 #include <set>
 #include <map>
 #include <string>
-#include <iostream>
 #include <string.h>
 
-#ifdef _WINDOWS
-#include <al.h>
-#include <alc.h>
-#else
 #include <AL/al.h>
 #include <AL/alc.h>
-#endif
 
 #include <ogg/ogg.h>
 #include <vorbis/codec.h>
 #include <vorbis/vorbisenc.h>
 #include <vorbis/vorbisfile.h>
 
+#ifdef EMYL_USE_BOOST
+	#include <boost/thread/thread.hpp>
+	#ifdef _MSC_VER
+		#include <Windows.h>
+		inline void emyl_sleep(int ms) { Sleep(ms); }
+	#else
+		#include <unistd.h>
+		inline void emyl_sleep(int ms) { usleep(ms*1000); }
+	#endif
+#endif
+
+#ifdef EMYL_USE_OGRE
+	#include <Ogre.h>
+#endif
+
+#if defined(_MSC_VER)
+	#pragma warning(disable: 4996) //fopen is deprecated, use fopen_s instead
+#endif
+
 namespace emyl {
+
+//Some globals here!
+static std::set<stream*> s_instances;
+#ifdef EMYL_USE_BOOST
+boost::thread_group    s_StreamingThread;
+#endif
 
 void default_error_callback (const std::string &s) {}
 error_callback _error_callback = default_error_callback;
-void setErrorCallback(error_callback cb) {_error_callback = cb;}
+void set_error_callback(error_callback cb) {_error_callback = cb;}
 
 /*---------------------------------------------------------------------------*/
 /*-libvorbis-inits-----------------------------------------------------------*/
@@ -32,7 +51,7 @@ void setErrorCallback(error_callback cb) {_error_callback = cb;}
 
 static int _fseek64_wrap(FILE *f, ogg_int64_t off, int whence){
 	if(f==NULL)return(-1);
-	return fseek(f,off,whence);
+	return fseek(f,(long)off,whence);
 }
 
 ov_callbacks callbacks = {
@@ -153,7 +172,7 @@ long int ftell_mem ( file_mem * stream )
 
 static int _fseek64_wrap_ram(file_mem *f, ogg_int64_t off, int whence){
 	if(f==NULL) return(-1);
-	return fseek_mem(f,off,whence);
+	return fseek_mem(f,(long)off,whence);
 }
 
 ov_callbacks callbacks_mem = {
@@ -163,6 +182,52 @@ ov_callbacks callbacks_mem = {
 	(long (*)(void *)) ftell_mem
 };
 
+/*---------------------------------------------------------------------------*/
+
+#ifdef EMYL_USE_OGRE
+
+// Functions to allow libogg to use Ogre's DataStreamPtrs. Code based on OgreOgg project.
+
+size_t OOSStreamRead(void *ptr, size_t size, size_t nmemb, void *datasource)
+{
+	Ogre::DataStreamPtr dataStream = *reinterpret_cast<Ogre::DataStreamPtr*>(datasource);
+	return dataStream->read(ptr, size);
+}
+
+int OOSStreamSeek(void *datasource, ogg_int64_t offset, int whence)
+{
+	Ogre::DataStreamPtr dataStream = *reinterpret_cast<Ogre::DataStreamPtr*>(datasource);
+	switch(whence) {
+		case SEEK_SET: dataStream->seek((size_t)offset); break;
+		case SEEK_END: dataStream->seek(dataStream->size()); // Falling through purposefully here
+		case SEEK_CUR: dataStream->skip((long)offset); break;
+	}
+	return 0;
+}
+
+int OOSStreamClose(void *datasource)
+{
+	return 0;
+}
+
+long OOSStreamTell(void *datasource)
+{
+	Ogre::DataStreamPtr dataStream = *reinterpret_cast<Ogre::DataStreamPtr*>(datasource);
+	return static_cast<long>(dataStream->tell());
+}
+
+ov_callbacks callbacks_ogre = {
+	(size_t (*) (void *, size_t, size_t, void *)) OOSStreamRead,
+	(int (*)(void *, ogg_int64_t, int)) OOSStreamSeek,
+	(int (*)(void *)) OOSStreamClose,
+	(long (*)(void *)) OOSStreamTell
+};
+
+/*---------------------------------------------------------------------------*/
+
+#endif
+
+/*---------------------------------------------------------------------------*/
 /*---------------------------------------------------------------------------*/
 /*-manager-------------------------------------------------------------------*/
 /*---------------------------------------------------------------------------*/
@@ -190,7 +255,7 @@ manager::~manager()
 {
 	alDeleteSources(NUM_SOURCES,m_vSources);
 	
-	// ELIMINA BUFFERS CREADOS.
+	// Delete created buffers
 	while(!m_mSounds.empty())
 	{
 		ALuint buffer = m_mSounds.begin()->second;
@@ -234,7 +299,7 @@ bool manager::init()
 	m_alDev = alcOpenDevice(NULL);
 	if (!m_alDev)
 	{
-		SetError("OpenAL error: Could not init OpenAL.\n");
+		set_error("OpenAL error: Could not init OpenAL.\n");
 		return false;
 	}
 
@@ -243,10 +308,10 @@ bool manager::init()
 	fprintf(stderr, "Audio device extensions: %s.\n", alcGetString(m_alDev, ALC_EXTENSIONS));
 #endif
 
-	m_alContext = alcCreateContext(m_alDev, NULL);	// Context para alDev
+	m_alContext = alcCreateContext(m_alDev, NULL);	// Context for alDev
 	if (!m_alContext)
 	{
-		SetError("OpenAL error: Context can't be created.\n");
+		set_error("OpenAL error: Context can't be created.\n");
 		return false;	
 	}
 	alcMakeContextCurrent(m_alContext);
@@ -255,7 +320,7 @@ bool manager::init()
 	alGenSources(NUM_SOURCES, m_vSources);
 	if(alGetError() != AL_NO_ERROR)
 	{
-		SetError("OpenAL error: Sources can't be created.\n");
+		set_error("OpenAL error: Sources can't be created.\n");
 		return false;
 	}
 
@@ -273,11 +338,7 @@ bool manager::init()
 
 /*---------------------------------------------------------------------------*/
 
-inline char *manager::get_error() {return m_sLastError;}
-
-/*---------------------------------------------------------------------------*/
-
-void manager::delete_buffer(std::string _filename)
+void manager::delete_buffer(const std::string& _filename)
 {
 	if(m_mSounds.find(_filename) != m_mSounds.end())
 	{
@@ -289,37 +350,67 @@ void manager::delete_buffer(std::string _filename)
 
 /*---------------------------------------------------------------------------*/
 
-ALuint manager::get_buffer(std::string _filename)
+ALuint manager::get_buffer(const std::string& _filename)
 {
 	std::map<std::string,ALuint>::iterator iter = m_mSounds.find(_filename);
 	if(iter != m_mSounds.end()) return iter->second;
 
 	const char *filename = _filename.c_str();
 
-	OggVorbis_File vf;
 	FILE *sndfile = fopen(filename, "rb");
 	if (sndfile == NULL)
 	{
-		SetError("Manager Error: File could not be opened.\n");
+		set_error("Manager Error: File could not be opened.\n");
 		return -1;
 	}
-	if (ov_open_callbacks(sndfile, &vf, NULL, 0, callbacks) < 0 ) {
-		fclose(sndfile);
-		SetError("OGG Error: It doesn't seem to be an OGG File.\n");
-		return -1;
-	}
+	
+	ALuint result = get_buffer_generic(sndfile,&callbacks);
+	if (result < 0) fclose(sndfile);
+	else m_mSounds[_filename] = result;
+	return result;
+}
 
+/*---------------------------------------------------------------------------*/
+
+#ifdef EMYL_USE_OGRE
+ALuint manager::get_buffer_ogre(const std::string& _resname)
+{
+	std::map<std::string,ALuint>::iterator iter = m_mSounds.find(_resname);
+	if(iter != m_mSounds.end()) return iter->second;
+
+	Ogre::ResourceGroupManager* groupManager = Ogre::ResourceGroupManager::getSingletonPtr();
+	Ogre::String group = groupManager->findGroupContainingResource(_resname);
+	static std::map<std::string,Ogre::DataStreamPtr> dataMap;
+	dataMap[_resname] = groupManager->openResource(_resname, group);
+
+	ALuint result = get_buffer_generic(&(dataMap[_resname]),&callbacks_ogre);
+	if (result>= 0) m_mSounds[_resname] = result;
+	return result;
+}
+
+/*---------------------------------------------------------------------------*/
+#endif
+
+ALuint manager::get_buffer_generic(void *sndfile, ov_callbacks *ptr_callbacks)
+{
+
+	OggVorbis_File vf;
+
+	if (ov_open_callbacks(sndfile, &vf, NULL, 0, *ptr_callbacks) < 0 ) {
+		set_error("OGG Error: It doesn't seem to be an OGG File.\n");
+		return -1;
+	}
+	
 	vorbis_info *vi = ov_info(&vf, -1);
 
-	//LOS SONIDOS NO PUEDEN DURAR MAS DE 10 SEGS NI SER STEREO
-	if((int)ov_pcm_total(&vf, -1) > (10*vi->rate) || vi->channels > 1) {
-		fclose(sndfile);
-		SetError("OGG Error: OGG File is too long to be a simple sound.\n");
+	//Sounds can only be 10 seconds long
+	if((int)ov_pcm_total(&vf, -1) > (10*vi->rate)) {
+		set_error("OGG Error: OGG File is too long to be a sound, use a stream instead.\n");
 		return -1;
 	}
+	//We only support mono sounds
 	if(vi->channels > 1) {
-		fclose(sndfile);
-		SetError("OGG Error: OGG File is not MONO.\n");
+		set_error("OGG Error: OGG File is not MONO.\n");
 		return -1;
 	}
 
@@ -354,7 +445,7 @@ ALuint manager::get_buffer(std::string _filename)
 	alGenBuffers(1, &newbuffer);
 	if(alGetError() != AL_NO_ERROR)
 	{
-		SetError("OpenAL Error: Buffer could not be generated.\n");
+		set_error("OpenAL Error: Buffer could not be generated.\n");
 		delete[] data;
 		return -1;
 	}
@@ -367,13 +458,10 @@ ALuint manager::get_buffer(std::string _filename)
 	if(alGetError() != AL_NO_ERROR)
 	{
 		alDeleteBuffers(1, &newbuffer);
-		SetError("OpenAL Error: Buffer could not be filled.\n");
+		set_error("OpenAL Error: Buffer could not be filled.\n");
 		return -1;
 	}
 
-	
-
-	m_mSounds[_filename] = newbuffer;
 	return newbuffer;	
 }
 
@@ -440,7 +528,7 @@ void manager::set_velocity(ALfloat _fX, ALfloat _fY, ALfloat _fZ)
 
 inline
 void manager::set_orientation(ALfloat _fDX, ALfloat _fDY, ALfloat _fDZ,
-                              ALfloat _fUX, ALfloat _fUY, ALfloat _fUZ)
+							  ALfloat _fUX, ALfloat _fUY, ALfloat _fUZ)
 {
 	ALfloat vfListenerOri[6] = { _fDX, _fDY, _fDZ, _fUX, _fUY, _fUZ};
 	alListenerfv(AL_ORIENTATION, vfListenerOri);
@@ -448,13 +536,17 @@ void manager::set_orientation(ALfloat _fDX, ALfloat _fDY, ALfloat _fDZ,
 
 /*---------------------------------------------------------------------------*/
 
-void manager::SetError(std::string _sErr)
+void manager::set_error(const std::string& _sErr)
 {
 	delete[] m_sLastError;
 	m_sLastError = new char[_sErr.size() + 1];
 
 	strcpy(m_sLastError, _sErr.c_str());
 	_error_callback(_sErr);
+	
+#ifdef EMYL_USE_OGRE
+	Ogre::LogManager::getSingletonPtr()->logMessage(m_sLastError);
+#endif
 
 #ifdef _DEBUG
 	fprintf(stderr, "%s.\n", _sErr.c_str());
@@ -497,8 +589,6 @@ void manager::unsleep()
 /*-stream--------------------------------------------------------------------*/
 /*---------------------------------------------------------------------------*/
 
-static std::set<stream*> s_instances;
-
 stream::stream()
 {
 	memset(this, 0, sizeof(stream));
@@ -527,11 +617,11 @@ bool stream::load(const std::string &_filename)
 	FILE *sndfile = fopen(filename, "rb");
 	if (sndfile == NULL)
 	{
-		SetError("File error: File doesn't exist.\n");
+		set_error("File error: File doesn't exist.\n");
 		return false;
 	}
 
-    bool success = load_generic((void *) sndfile, &callbacks);
+	bool success = load_generic((void *) sndfile, &callbacks);
 	if(!success) fclose(sndfile);
 	return success;
 }
@@ -542,7 +632,7 @@ bool stream::load_mem(const std::string &_filename)
 	file_mem *sndfile = fopen_mem(filename);
 	if (sndfile == NULL)
 	{
-		SetError("File error: File doesn't exist.\n");
+		set_error("File error: File doesn't exist.\n");
 		return false;
 	}
 
@@ -550,6 +640,18 @@ bool stream::load_mem(const std::string &_filename)
 	if(!success) fclose_mem(sndfile);
 	return success;
 }
+
+#ifdef EMYL_USE_OGRE
+bool stream::load_ogre(const std::string& resname)
+{
+	Ogre::ResourceGroupManager* groupManager = Ogre::ResourceGroupManager::getSingletonPtr();
+	Ogre::String group = groupManager->findGroupContainingResource(resname);
+	static std::map<std::string,Ogre::DataStreamPtr> dataMap;
+	dataMap[resname] = groupManager->openResource(resname, group);
+
+	return load_generic(&(dataMap[resname]), &callbacks_ogre);
+}
+#endif
 
 bool stream::load_generic(void *sndfile, ov_callbacks *ptr_callbacks)
 {
@@ -559,22 +661,22 @@ bool stream::load_generic(void *sndfile, ov_callbacks *ptr_callbacks)
 		alGenBuffers(NUM_BUFFERS, m_vbuffers);
 		if(alGetError() != AL_NO_ERROR)
 		{
-			SetError("OpenAL Error: Buffer could not be generated.\n");
+			set_error("OpenAL Error: Buffer could not be generated.\n");
 			return false;
 		}
 		m_uiFlags |= STREAM_OGG_INIT;
 	}
 
 	if(!(m_uiFlags & STREAM_OGG_INIT) ||
-	     m_uiFlags & STREAM_OGG_PLAYING)
+		 m_uiFlags & STREAM_OGG_PLAYING)
 	{
-		SetError("Error: Can't load while playing.\n");
+		set_error("Error: Can't load while playing.\n");
 		return false;
 	}
 
 	OggVorbis_File vf;
 	if (ov_open_callbacks(sndfile, &vf, NULL, 0, *ptr_callbacks) < 0 ) {
-		SetError("Ogg error: File doesn't seem to be OGG file.\n");
+		set_error("OGG error: File doesn't seem to be OGG file.\n");
 		return false;
 	}
 
@@ -609,7 +711,7 @@ bool stream::set_source(ALuint _source)
 {
 	if(alIsSource(_source) == AL_FALSE)
 	{
-		SetError("OpenAL Error: Source isn't valid.\n");
+		set_error("OpenAL Error: Source isn't valid.\n");
 		return false;
 	}
 	m_uiSource = _source;
@@ -672,12 +774,37 @@ void stream::play()
 		alSourceQueueBuffers (m_uiSource, 1, m_vbuffers+i);
 	}
 
-	//Lo aadimos
+	//We add it
 	s_instances.insert(this);
 
+#ifdef EMYL_USE_BOOST
+	//Start the update thread
+	if (s_instances.size() == 1) s_StreamingThread.create_thread(&updateThread); //Abans no hi havia cap stream
+#endif
+	
 	m_uiFlags |= STREAM_OGG_PLAYING;
 }
+
 /*---------------------------------------------------------------------------*/
+
+#ifdef EMYL_USE_BOOST
+void stream::updateThread()
+{
+	int size = s_instances.size();
+
+	while(size != 0)
+	{	
+		std::set<stream*>::iterator iter = s_instances.begin();
+		for(iter = s_instances.begin(); iter != s_instances.end(); iter++) (*iter)->update();
+
+		emyl_sleep(400/size);
+		size = s_instances.size();
+	}
+}
+#endif
+
+/*---------------------------------------------------------------------------*/
+
 void stream::stop()
 {
 	if(m_uiFlags&STREAM_OGG_PLAYING)
@@ -686,7 +813,6 @@ void stream::stop()
 		s_instances.erase(this);
 	}
 }
-
 
 /*---------------------------------------------------------------------------*/
 
@@ -708,7 +834,7 @@ void stream::update()
 		{
 			alSourceQueueBuffers(m_uiSource, 1, &buffer);
 		}
-		else // SE ACABO EL FICHERO.
+		else //End of file
 		{
 			m_uiFlags &= ~(STREAM_OGG_PLAYING|STREAM_OGG_PAUSE);
 			break;
@@ -720,7 +846,7 @@ void stream::update()
 
 	if(m_uiFlags & STREAM_OGG_PAUSE)
 	{
-	     if(state != AL_PAUSED) alSourcePause(m_uiSource);
+		 if(state != AL_PAUSED) alSourcePause(m_uiSource);
 	}
 	else
 	{
@@ -763,18 +889,18 @@ void stream::seek(double _secs)
 				break;
 			case OV_EINVAL:
 				fprintf(stderr, "Invalid argument value; possibly called with \
-				        an OggVorbis_File structure that isn't open.\n");
+						an OggVorbis_File structure that isn't open.\n");
 				break;
 			case OV_EREAD:
 				fprintf(stderr, "A read from media returned an error.\n");
 				break;
 			case OV_EFAULT:
 				fprintf(stderr, "Internal logic fault; indicates a bug or \
-				        heap/stack corruption.\n");
+						heap/stack corruption.\n");
 				break;
 			case OV_EBADLINK:
 				fprintf(stderr, "Invalid stream section supplied to \
-				        libvorbisfile, or the requested link is corrupt. \n");
+						libvorbisfile, or the requested link is corrupt. \n");
 				break;
 		}
 #else
@@ -833,7 +959,7 @@ bool stream::bStream(ALuint _buff)
 			}
 		}
 	}
-    
+	
 	if(bytes == 0) return false;
 
 /*	//DEBUG	
@@ -845,22 +971,22 @@ bool stream::bStream(ALuint _buff)
 
 	alBufferData(_buff, m_eformat, data, bytes, m_ifreq);
 	
-    return true;
+	return true;
 }
 
 /*---------------------------------------------------------------------------*/
 
-inline char *stream::get_error() {return m_sLastError;}
-
-/*---------------------------------------------------------------------------*/
-
-void stream::SetError(std::string _sErr)
+void stream::set_error(const std::string& _sErr)
 {
 	delete m_sLastError;
 	m_sLastError = new char[_sErr.size() + 1];
 
 	strcpy(m_sLastError, _sErr.c_str());
 	_error_callback(_sErr);
+
+#ifdef EMYL_USE_OGRE
+	Ogre::LogManager::getSingletonPtr()->logMessage(m_sLastError);
+#endif
 
 #ifdef _DEBUG
 	fprintf(stderr, "%s.\n", _sErr.c_str());
@@ -899,6 +1025,20 @@ bool sound::set_buffer(ALuint _buffer)
 	return true;
 }
 
+bool sound::load(const std::string& _filename)
+{
+	return set_buffer( manager::get_instance()->get_buffer(_filename) );
+}
+
+#ifdef EMYL_USE_OGRE
+
+bool sound::load_ogre(const std::string& _resname)
+{ 
+	return  set_buffer( manager::get_instance()->get_buffer_ogre(_resname) );
+}
+
+#endif
+
 /*---------------------------------------------------------------------------*/
 
 bool sound::set_source()
@@ -918,7 +1058,7 @@ bool sound::set_source(ALuint _source)
 {
 	if(alIsSource(_source) == AL_FALSE)
 	{
-		SetError("OpenAL Error: Source isn't valid.\n");
+		set_error("OpenAL Error: Source isn't valid.\n");
 		return false;
 	}
 	m_uiSource = _source;
@@ -1056,17 +1196,17 @@ void sound::set_direction (ALfloat _fX,  ALfloat _fY,  ALfloat _fZ)
 
 /*---------------------------------------------------------------------------*/
 
-char* sound::get_error() {return m_sLastError;}
-
-/*---------------------------------------------------------------------------*/
-
-void sound::SetError(std::string _sErr)
+void sound::set_error(const std::string& _sErr)
 {
 	delete m_sLastError;
 	m_sLastError = new char[_sErr.size() + 1];
 
 	strcpy(m_sLastError, _sErr.c_str());
 	_error_callback(_sErr);
+
+#ifdef EMYL_USE_OGRE
+	Ogre::LogManager::getSingletonPtr()->logMessage(m_sLastError);
+#endif
 
 #ifdef _DEBUG
 	fprintf(stderr, "%s.\n", _sErr.c_str());

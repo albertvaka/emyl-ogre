@@ -1,21 +1,19 @@
 #pragma once
 
+//Uncoment this to enable loading audio from an Ogre resource in addition to load from a file
+#define EMYL_USE_OGRE
+
+//Uncoment this if you have Boost and want emyl to create a thread to automatically update() the streams for you
+//#define EMYL_USE_BOOST
+
 #include <vector>
 #include <list>
 #include <map>
 #include <string>
+#include <stdlib.h>
 
-#ifdef _WINDOWS
-#include <al.h>
-#include <alc.h>
-#include <windows.h>
-#define SLEEP(X) Sleep(X)
-#else
 #include <AL/al.h>
 #include <AL/alc.h>
-#include <stdlib.h>
-#define SLEEP(X) usleep(X*1000)
-#endif
 
 #include <ogg/ogg.h>
 #include <vorbis/codec.h>
@@ -38,6 +36,7 @@ public:
 
 	bool   load    (const std::string &_filename);
 	bool   load_mem(const std::string &_filename);
+	bool   load_ogre(const std::string &_resname);
 	bool   load_generic(void *sndfile, ov_callbacks *ptr_callbacks);
 
 	bool   set_source();
@@ -56,7 +55,7 @@ public:
 	void   set_loop(bool _loop);
 	void   set_volume(ALfloat _volume);
 
-	char*  get_error();
+	char*  get_error() {return m_sLastError;}
 
 	static void updateAll();
 
@@ -64,7 +63,11 @@ private:
 	static const int NUM_BUFFERS = 8;
 	static const int BUFFER_SIZE = 65536;
 
-	void SetError(std::string _sErr);
+#ifdef EMYL_USE_BOOST
+	static void updateThread();
+#endif
+
+	void set_error(const std::string& _sErr);
 	bool bStream(ALuint _buff);
 	
 	ALenum  m_eformat;
@@ -84,9 +87,13 @@ public:
 	 sound();
 	~sound();
 	
+	bool   load(const std::string& _filename);
+#ifdef EMYL_USE_OGRE
+	bool   load_ogre(const std::string& _resname);
+#endif
+
 	bool   set_buffer(ALuint _buffer);
 	ALuint get_buffer() {return m_vbuffer;}
-
 
 	bool   set_source();
 	bool   set_source(ALuint _source);
@@ -111,16 +118,15 @@ public:
 	void set_velocity  (ALfloat _fX,  ALfloat _fY,  ALfloat _fZ);
 	void set_direction (ALfloat _fX,  ALfloat _fY,  ALfloat _fZ);
 
-	char* get_error();
+	char* get_error() {return m_sLastError;}
 private:
-	void SetError(std::string _sErr);
+	void set_error(const std::string& _sErr);
 
 	ALuint m_vbuffer;
 	ALuint m_uiSource;
 
 	char*  m_sLastError;
 };
-
 
 class manager
 {
@@ -131,14 +137,17 @@ public:
 	static manager*  get_instance();
 	bool             init();
 
-	void             delete_buffer(std::string _filename);
-	ALuint           get_buffer(std::string _filename);
+	void             delete_buffer(const std::string& _filename);
+	ALuint           get_buffer(const std::string& _filename);
+#ifdef EMYL_USE_OGRE
+	ALuint           get_buffer_ogre(const std::string& resName);
+#endif
 
 	ALuint           source_reserve();
 	void             source_unreserve(ALuint _srcID);
 
 	void             set_volume(ALfloat _volume);
-	char*            get_error();
+	char*            get_error() {return m_sLastError;}
 
 	void set_position    (ALfloat _fX,  ALfloat _fY,  ALfloat _fZ);
 	void set_velocity    (ALfloat _fX,  ALfloat _fY,  ALfloat _fZ);
@@ -149,13 +158,16 @@ public:
 	void unsleep();
 
 private:
+	
+	//Should not be public because does not use m_mSounds map
+	ALuint           get_buffer_generic(void *sndfile, ov_callbacks *ptr_callbacks);
 
 	friend class stream;
 	friend class sound;
 
 	static const int NUM_SOURCES = 16;
 
-	void SetError(std::string _sErr);
+	void set_error(const std::string& _sErr);
 
 	manager();
 
@@ -176,7 +188,7 @@ private:
 };
 
 typedef void(*error_callback)(const std::string &_sErr);
-void setErrorCallback(error_callback callback);
+void set_error_callback(error_callback callback);
 
 } //namespace emyl;
 
