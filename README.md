@@ -14,7 +14,7 @@ This library is meant to be included directly in your project code and be static
 This fork
 ---------
 
-This fork mainly adds two functionalities to the Emyl:
+This fork mainly adds two functionalities to Emyl:
 
  * Loading files not only from disk but also from Ogre resurces, to integrate seamlessly with Ogre-based games.
  
